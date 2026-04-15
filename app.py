@@ -13,9 +13,9 @@ from google.genai import types
 if 'caption_cache' not in st.session_state:
     st.session_state.caption_cache = {}
 
-# --- Advanced Text Extraction (XPath SmartArt Fix) ---
+# --- Advanced Text Extraction (The SmartArt Data.xml Fix) ---
 def get_shape_text(shape):
-    """Extracts text using both standard API and deep XPath XML drilling."""
+    """Extracts text using standard API, XPath, and deep XML Relationship drilling."""
     text_content = []
     
     # 1. Standard Text Frames
@@ -31,13 +31,21 @@ def get_shape_text(shape):
         except AttributeError:
             pass
             
-    # 3. SmartArt & Graphic Frames (Deep XPath Dive)
+    # 3. SmartArt & Graphic Frames (Deep Zip Archive Dive)
     elif getattr(shape, "shape_type", None) in [19, 24] or hasattr(shape._element, 'nvGraphicFramePr'):
         try:
-            # XPath './/a:t' finds ALL text nodes anywhere inside this shape's XML
+            # A. Check the immediate XML for standard text nodes
             for text_node in shape._element.xpath('.//a:t'):
                 if text_node.text and text_node.text.strip():
                     text_content.append(text_node.text.strip())
+                    
+            # B. Check the hidden diagramData files (where SmartArt text actually lives)
+            for rel in shape.part.rels.values():
+                if "diagramData" in rel.reltype:
+                    # Decode the hidden XML file and use regex to grab all text inside <a:t> tags
+                    xml_str = rel.target_part.blob.decode('utf-8', errors='ignore')
+                    hidden_texts = re.findall(r'<a:t[^>]*>(.*?)</a:t>', xml_str)
+                    text_content.extend([t.strip() for t in hidden_texts if t.strip()])
         except Exception:
             pass
         
@@ -51,11 +59,12 @@ def get_slide_text(slide):
 
 # --- Universal ADA Injection Helper ---
 def set_alt_text(shape, alt_text):
-    """Injects alt text by aggressively hunting for the description tag."""
+    """Injects alt text using native lxml .set() for absolute compliance."""
     try:
         for prop in ['nvPicPr', 'nvSpPr', 'nvGraphicFramePr', 'nvGrpSpPr']:
             if hasattr(shape._element, prop):
-                getattr(shape._element, prop).cNvPr.attrib['descr'] = alt_text
+                # Using .set() ensures the XML tree registers the new attribute
+                getattr(shape._element, prop).cNvPr.set('descr', alt_text)
                 return
     except Exception:
         pass
@@ -88,7 +97,7 @@ def generate_caption(client, image_bytes, prev_text, curr_text, model_name, is_d
     """
     
     if is_diagram:
-        user_prompt = f"Describe this diagram/SmartArt based on its extracted text: '{diagram_text}'. Context: {curr_text}"
+        user_prompt = f"Describe this structural diagram based on its extracted text: '{diagram_text}'. Context from the rest of the slide: {curr_text}"
         contents = [user_prompt]
     else:
         image = Image.open(io.BytesIO(image_bytes))
@@ -100,9 +109,8 @@ def generate_caption(client, image_bytes, prev_text, curr_text, model_name, is_d
 
     for attempt in range(max_retries):
         try:
-            time.sleep(3) # Standard safety buffer
+            time.sleep(3) 
             
-            # Dynamically build the config to support Gemma's thinking mode
             config_args = {
                 "system_instruction": system_prompt,
                 "temperature": 0.2
@@ -122,7 +130,7 @@ def generate_caption(client, image_bytes, prev_text, curr_text, model_name, is_d
             
             if "429" in err_str or "503" in err_str or "quota" in err_str:
                 if "day" in err_str or "daily" in err_str:
-                    return f"Error: Daily API quota (RPD) exceeded for {model_name}. Please switch models."
+                    return f"Error: Daily API quota exceeded for {model_name}. Please switch models."
                 
                 if attempt < max_retries - 1:
                     sec_match = re.search(r'in\s*(\d+)\s*s', err_str)
@@ -153,7 +161,6 @@ def generate_and_add_title(client, slide, slide_text):
             break
 
     if not has_title and slide_text.strip():
-        # Title generator uses a fast/cheap model to save main quota if possible
         prompt = f"Create a concise, 3-to-6 word title for a presentation slide containing this text. Output ONLY the title.\n\nText: {slide_text}"
         try:
             response = client.models.generate_content(model='gemini-1.5-flash', contents=prompt)
@@ -165,7 +172,7 @@ def generate_and_add_title(client, slide, slide_text):
 
 # --- Main App ---
 st.set_page_config(page_title="ADA PPTX Automator Pro", layout="centered")
-st.title("♿ ADA Course Material Automator (v9)")
+st.title("♿ ADA Course Material Automator (v10)")
 st.markdown("Features aggressive image hunting, deep SmartArt XML extraction, model fallback, and smart API error retries.")
 
 api_key = st.text_input("Enter your Gemini API Key:", type="password")
@@ -228,13 +235,13 @@ if uploaded_file and api_key:
                         # 2. SMART_ART / GRAPHIC FRAMES / GROUPS
                         if getattr(shape, "shape_type", None) in [MSO_SHAPE_TYPE.GROUP, 19, 24] or hasattr(shape._element, 'nvGraphicFramePr'):
                             d_text = get_shape_text(shape)
-                            if d_text:
-                                caption = generate_caption(client, None, prev_text, curr_text, model_name=selected_model, is_diagram=True, diagram_text=d_text)
-                                if not caption.startswith("Error"):
-                                    set_alt_text(shape, caption)
-                                    api_calls += 1
-                                else:
-                                    st.warning(f"Slide {i+1} SmartArt Issue: {caption}")
+                            # Remove the blocker. Even if d_text is empty, use the slide context to deduce the diagram.
+                            caption = generate_caption(client, None, prev_text, curr_text, model_name=selected_model, is_diagram=True, diagram_text=d_text)
+                            if not caption.startswith("Error"):
+                                set_alt_text(shape, caption)
+                                api_calls += 1
+                            else:
+                                st.warning(f"Slide {i+1} SmartArt Issue: {caption}")
                                     
                 if do_reading_order:
                     fix_reading_order(slide)
