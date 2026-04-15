@@ -21,8 +21,8 @@ def get_shape_text(shape):
     if getattr(shape, "has_text_frame", False):
         for paragraph in shape.text_frame.paragraphs:
             text_content.append(paragraph.text)
-    # Check if the shape is a group or SmartArt containing sub-shapes
-    elif getattr(shape, "shape_type", None) in [MSO_SHAPE_TYPE.GROUP, MSO_SHAPE_TYPE.SMART_ART]:
+    # 24 is the internal PowerPoint integer for SmartArt
+    elif getattr(shape, "shape_type", None) in [MSO_SHAPE_TYPE.GROUP, 24]:
         try:
             for subshape in shape.shapes:
                 text_content.append(get_shape_text(subshape))
@@ -127,12 +127,12 @@ def generate_and_add_title(client, slide, slide_text):
 
 # --- Main App ---
 st.set_page_config(page_title="ADA PPTX Automator Pro", layout="centered")
-st.title("♿ ADA Course Material Automator (v3)")
+st.title("♿ ADA Course Material Automator (v4)")
 st.markdown("Upload a `.pptx` file to generate ADA-compliant Alt Text, fix reading order, and generate missing slide titles. Features image deduplication to save API calls.")
 
 api_key = st.text_input("Enter your Gemini API Key:", type="password")
 
-# --- UI Checkboxes Restored ---
+# --- UI Checkboxes ---
 st.markdown("### Select ADA Fixes to Apply:")
 do_captions = st.checkbox("Generate Image/SmartArt Captions (Alt Text)", value=True)
 do_titles = st.checkbox("Generate Missing Slide Titles", value=True)
@@ -155,7 +155,6 @@ if uploaded_file and api_key:
             total_slides = len(prs.slides)
             
             for i, slide in enumerate(prs.slides):
-                # We now safely use get_slide_text to prevent the AttributeError
                 curr_text = get_slide_text(slide) 
                 
                 # 1. Missing Titles
@@ -183,8 +182,8 @@ if uploaded_file and api_key:
                                 else:
                                     st.warning(f"Rate limit reached on slide {i+1}. Try a smaller file.")
                         
-                        # SMART_ART / GROUPS
-                        elif getattr(shape, "shape_type", None) in [MSO_SHAPE_TYPE.SMART_ART, MSO_SHAPE_TYPE.GROUP]:
+                        # SMART_ART (24) / GROUPS
+                        elif getattr(shape, "shape_type", None) in [MSO_SHAPE_TYPE.GROUP, 24]:
                             d_text = get_shape_text(shape)
                             if d_text:
                                 caption = generate_caption(client, None, prev_text, curr_text, is_diagram=True, diagram_text=d_text)
