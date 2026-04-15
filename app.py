@@ -4,6 +4,7 @@ from pptx.enum.shapes import MSO_SHAPE_TYPE
 from pptx.util import Inches
 import io
 import time
+import re
 from PIL import Image
 from google import genai
 from google.genai import types
@@ -78,9 +79,8 @@ def fix_reading_order(slide):
             parent.remove(shape._element)
             parent.append(shape._element)
 
-# --- AI Generation (With Exponential Backoff) ---
-def generate_caption(client, image_bytes, prev_text, curr_text, is_diagram=False, diagram_text=""):
-    """Calls Gemini with Retry Logic for 503/429 errors."""
+# --- AI Generation (With Smart Dynamic UI Countdown and Quota Parsing) ---
+def generate_caption(client, image_bytes, prev_text, curr_text, model_name, is_diagram=False, diagram_text=""):
     system_prompt = """
     You are an expert in ADA compliance for engineering courses. 
     Generate concise, pedagogical Alt Text (under 125 chars). 
@@ -95,25 +95,53 @@ def generate_caption(client, image_bytes, prev_text, curr_text, is_diagram=False
         user_prompt = f"Analyze this image. Context: {curr_text}. Previous context: {prev_text}."
         contents = [image, user_prompt]
 
-    max_retries = 3
+    max_retries = 3 
+    base_wait = 15  
+
     for attempt in range(max_retries):
         try:
-            time.sleep(3) # Standard rate limit buffer
+            time.sleep(3) # Standard safety buffer
+            
+            # Dynamically build the config to support Gemma's thinking mode
+            config_args = {
+                "system_instruction": system_prompt,
+                "temperature": 0.2
+            }
+            if "gemma-4" in model_name:
+                config_args["thinking_config"] = types.ThinkingConfig(thinking_level="high")
+
             response = client.models.generate_content(
-                model='gemini-2.5-flash',
+                model=model_name,
                 contents=contents,
-                config=types.GenerateContentConfig(system_instruction=system_prompt, temperature=0.2)
+                config=types.GenerateContentConfig(**config_args)
             )
             return response.text.strip()
-        except Exception as e:
-            err_str = str(e)
-            if "503" in err_str or "429" in err_str:
-                if attempt < max_retries - 1:
-                    time.sleep(5 * (attempt + 1)) # Backoff: wait 5s, then 10s
-                    continue
-            return f"Error: {err_str}"
             
-    return "Error: Model overloaded after multiple retries."
+        except Exception as e:
+            err_str = str(e).lower()
+            
+            if "429" in err_str or "503" in err_str or "quota" in err_str:
+                if "day" in err_str or "daily" in err_str:
+                    return f"Error: Daily API quota (RPD) exceeded for {model_name}. Please switch models."
+                
+                if attempt < max_retries - 1:
+                    sec_match = re.search(r'in\s*(\d+)\s*s', err_str)
+                    if not sec_match:
+                        sec_match = re.search(r'(\d+)\s*second', err_str)
+                        
+                    wait_time = int(sec_match.group(1)) + 2 if sec_match else base_wait * (attempt + 1)
+                    
+                    countdown_placeholder = st.empty()
+                    for seconds_left in range(wait_time, 0, -1):
+                        countdown_placeholder.warning(f"⏳ Rate limit hit! Resuming in {seconds_left} seconds...")
+                        time.sleep(1)
+                    
+                    countdown_placeholder.empty() 
+                    continue 
+                    
+            return f"Error: {str(e)}"
+            
+    return "Error: Model overloaded after max retries."
 
 def generate_and_add_title(client, slide, slide_text):
     has_title = False
@@ -125,9 +153,10 @@ def generate_and_add_title(client, slide, slide_text):
             break
 
     if not has_title and slide_text.strip():
+        # Title generator uses a fast/cheap model to save main quota if possible
         prompt = f"Create a concise, 3-to-6 word title for a presentation slide containing this text. Output ONLY the title.\n\nText: {slide_text}"
         try:
-            response = client.models.generate_content(model='gemini-2.5-flash', contents=prompt)
+            response = client.models.generate_content(model='gemini-1.5-flash', contents=prompt)
             title_text = response.text.strip()
             txBox = slide.shapes.add_textbox(Inches(-5), Inches(-5), Inches(1), Inches(1))
             txBox.text = f"[Hidden Title] {title_text}"
@@ -136,10 +165,16 @@ def generate_and_add_title(client, slide, slide_text):
 
 # --- Main App ---
 st.set_page_config(page_title="ADA PPTX Automator Pro", layout="centered")
-st.title("♿ ADA Course Material Automator (v6)")
-st.markdown("Features aggressive image hunting, deep SmartArt XML extraction, and API error retries.")
+st.title("♿ ADA Course Material Automator (v9)")
+st.markdown("Features aggressive image hunting, deep SmartArt XML extraction, model fallback, and smart API error retries.")
 
 api_key = st.text_input("Enter your Gemini API Key:", type="password")
+
+st.markdown("### Model Selection")
+selected_model = st.selectbox(
+    "Choose AI Model (Switch to Gemma if Gemini hits daily quota):",
+    ("gemini-2.5-flash", "gemma-4-31b-it", "gemini-1.5-flash")
+)
 
 st.markdown("### Select ADA Fixes to Apply:")
 do_captions = st.checkbox("Generate Image/SmartArt Captions (Alt Text)", value=True)
@@ -157,7 +192,7 @@ if uploaded_file and api_key:
         api_calls = 0
         prev_text = ""
         
-        with st.spinner("Processing slides... (This may take a moment due to API rate limits)"):
+        with st.spinner(f"Processing slides using {selected_model}..."):
             progress_bar = st.progress(0)
             total_slides = len(prs.slides)
             
@@ -169,25 +204,24 @@ if uploaded_file and api_key:
                 
                 if do_captions:
                     for shape in slide.shapes:
-                        # 1. AGGRESSIVE IMAGE HUNTING (Catches standard pictures AND placeholders)
+                        # 1. AGGRESSIVE IMAGE HUNTING
                         try:
                             if hasattr(shape, "image"):
                                 img_bytes = shape.image.blob
-                                # Use PowerPoint's native sha1 hash for better deduplication
                                 img_hash = shape.image.sha1 
                                 
                                 if img_hash in st.session_state.caption_cache:
                                     set_alt_text(shape, st.session_state.caption_cache[img_hash])
                                     saved_calls += 1
                                 else:
-                                    caption = generate_caption(client, img_bytes, prev_text, curr_text)
+                                    caption = generate_caption(client, img_bytes, prev_text, curr_text, model_name=selected_model)
                                     if not caption.startswith("Error"):
                                         st.session_state.caption_cache[img_hash] = caption
                                         set_alt_text(shape, caption)
                                         api_calls += 1
                                     else:
                                         st.warning(f"Slide {i+1} Issue: {caption}")
-                                continue # Move to next shape if we successfully handled an image
+                                continue 
                         except Exception:
                             pass
                         
@@ -195,10 +229,12 @@ if uploaded_file and api_key:
                         if getattr(shape, "shape_type", None) in [MSO_SHAPE_TYPE.GROUP, 19, 24] or hasattr(shape._element, 'nvGraphicFramePr'):
                             d_text = get_shape_text(shape)
                             if d_text:
-                                caption = generate_caption(client, None, prev_text, curr_text, is_diagram=True, diagram_text=d_text)
+                                caption = generate_caption(client, None, prev_text, curr_text, model_name=selected_model, is_diagram=True, diagram_text=d_text)
                                 if not caption.startswith("Error"):
                                     set_alt_text(shape, caption)
                                     api_calls += 1
+                                else:
+                                    st.warning(f"Slide {i+1} SmartArt Issue: {caption}")
                                     
                 if do_reading_order:
                     fix_reading_order(slide)
