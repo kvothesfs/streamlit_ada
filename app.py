@@ -13,21 +13,34 @@ from google.genai import types
 if 'caption_cache' not in st.session_state:
     st.session_state.caption_cache = {}
 
-# --- Text Extraction Helpers ---
+# --- Advanced Text Extraction (The SmartArt Fix) ---
 def get_shape_text(shape):
-    """Safely extracts text from individual shapes, Groups, and SmartArt."""
+    """Safely extracts text, including deep XML parsing for SmartArt & Graphic Frames."""
     text_content = []
-    # Check if the shape has a text frame
+    
+    # 1. Standard Text Frames
     if getattr(shape, "has_text_frame", False):
         for paragraph in shape.text_frame.paragraphs:
             text_content.append(paragraph.text)
-    # 24 is the internal PowerPoint integer for SmartArt
-    elif getattr(shape, "shape_type", None) in [MSO_SHAPE_TYPE.GROUP, 24]:
+            
+    # 2. Groups (Recursively check subshapes)
+    elif getattr(shape, "shape_type", None) == MSO_SHAPE_TYPE.GROUP:
         try:
             for subshape in shape.shapes:
                 text_content.append(get_shape_text(subshape))
         except AttributeError:
             pass
+            
+    # 3. SmartArt & Graphic Frames (Deep XML Dive)
+    # Graphic Frames (19) and SmartArt (24) hide text in DrawingML <a:t> nodes
+    elif getattr(shape, "shape_type", None) in [19, 24]:
+        xml_text = []
+        # Iterate through the raw XML tree looking for text nodes
+        for node in shape._element.iter():
+            if node.tag.endswith('}t') and node.text: # Matches <a:t>
+                xml_text.append(node.text)
+        text_content.extend(xml_text)
+        
     return " ".join(text_content).strip()
 
 def get_slide_text(slide):
@@ -41,14 +54,22 @@ def get_image_hash(image_bytes):
     """Generates a unique ID for an image to prevent redundant API calls."""
     return hashlib.md5(image_bytes).hexdigest()
 
-# --- ADA Injection Helpers ---
+# --- Universal ADA Injection Helper ---
 def set_alt_text(shape, alt_text):
-    """Injects alt text into the shape's underlying XML metadata."""
+    """Injects alt text into the underlying XML metadata for ANY shape type."""
     try:
-        if getattr(shape, "shape_type", None) == MSO_SHAPE_TYPE.PICTURE:
+        # Pictures
+        if hasattr(shape._element, 'nvPicPr'):
             shape._element.nvPicPr.cNvPr.attrib['descr'] = alt_text
-        else:
+        # Standard Shapes
+        elif hasattr(shape._element, 'nvSpPr'):
             shape._element.nvSpPr.cNvPr.attrib['descr'] = alt_text
+        # SmartArt / Graphic Frames
+        elif hasattr(shape._element, 'nvGraphicFramePr'):
+            shape._element.nvGraphicFramePr.cNvPr.attrib['descr'] = alt_text
+        # Groups
+        elif hasattr(shape._element, 'nvGrpSpPr'):
+            shape._element.nvGrpSpPr.cNvPr.attrib['descr'] = alt_text
     except Exception:
         pass
 
@@ -64,7 +85,6 @@ def fix_reading_order(slide):
         except Exception:
             pass
             
-    # Sort primarily by Y-coordinate, secondarily by X-coordinate
     sortable_shapes.sort(key=lambda s: (round(s.top / 100000) * 100000, s.left))
     
     if sortable_shapes:
@@ -76,7 +96,7 @@ def fix_reading_order(slide):
 # --- AI Generation ---
 def generate_caption(client, image_bytes, prev_text, curr_text, is_diagram=False, diagram_text=""):
     """Calls Gemini API to generate alt text, with built-in rate limiting."""
-    time.sleep(4) # Rate limit buffer for the free tier (~15 RPM)
+    time.sleep(4) 
     
     system_prompt = """
     You are an expert in ADA compliance for engineering courses. 
@@ -84,17 +104,20 @@ def generate_caption(client, image_bytes, prev_text, curr_text, is_diagram=False
     Focus strictly on the system mechanics, flow, or logical structure depicted.
     """
     
+    # Model name fixed to gemini-2.5-flash
+    model_name = 'gemini-2.5-flash'
+    
     if is_diagram:
         user_prompt = f"Describe this diagram/SmartArt based on its extracted text: '{diagram_text}'. Slide Context: {curr_text}"
         contents = [user_prompt]
     else:
         image = Image.open(io.BytesIO(image_bytes))
-        user_prompt = f"Analyze this image. Slide Context: {curr_text}. Previous context: {prev_text}. Example: If this discusses batch processing Gantt charts or facility layout patterns, describe the specific schedules or material flow paths."
+        user_prompt = f"Analyze this image. Slide Context: {curr_text}. Previous context: {prev_text}."
         contents = [image, user_prompt]
 
     try:
         response = client.models.generate_content(
-            model='gemini-1.5-flash',
+            model=model_name,
             contents=contents,
             config=types.GenerateContentConfig(system_instruction=system_prompt, temperature=0.2)
         )
@@ -105,7 +128,6 @@ def generate_caption(client, image_bytes, prev_text, curr_text, is_diagram=False
         return f"Error: {str(e)}"
 
 def generate_and_add_title(client, slide, slide_text):
-    """Generates a hidden title for screen readers if the slide is missing one."""
     has_title = False
     for shape in slide.shapes:
         if shape.is_placeholder and shape.placeholder_format.type == 1:
@@ -117,7 +139,7 @@ def generate_and_add_title(client, slide, slide_text):
     if not has_title and slide_text.strip():
         prompt = f"Create a concise, 3-to-6 word title for a presentation slide containing this text. Output ONLY the title, no quotes.\n\nText: {slide_text}"
         try:
-            response = client.models.generate_content(model='gemini-1.5-flash', contents=prompt)
+            response = client.models.generate_content(model='gemini-2.5-flash', contents=prompt)
             title_text = response.text.strip()
             
             txBox = slide.shapes.add_textbox(Inches(-5), Inches(-5), Inches(1), Inches(1))
@@ -127,12 +149,11 @@ def generate_and_add_title(client, slide, slide_text):
 
 # --- Main App ---
 st.set_page_config(page_title="ADA PPTX Automator Pro", layout="centered")
-st.title("♿ ADA Course Material Automator (v4)")
-st.markdown("Upload a `.pptx` file to generate ADA-compliant Alt Text, fix reading order, and generate missing slide titles. Features image deduplication to save API calls.")
+st.title("♿ ADA Course Material Automator (v5)")
+st.markdown("Upload a `.pptx` file to generate ADA-compliant Alt Text. Features deep XML extraction for SmartArt and image deduplication.")
 
 api_key = st.text_input("Enter your Gemini API Key:", type="password")
 
-# --- UI Checkboxes ---
 st.markdown("### Select ADA Fixes to Apply:")
 do_captions = st.checkbox("Generate Image/SmartArt Captions (Alt Text)", value=True)
 do_titles = st.checkbox("Generate Missing Slide Titles", value=True)
@@ -165,7 +186,7 @@ if uploaded_file and api_key:
                 # 2. Image and SmartArt Captions
                 if do_captions:
                     for shape in slide.shapes:
-                        # PICTURES
+                        # PICTURES (13)
                         if getattr(shape, "shape_type", None) == MSO_SHAPE_TYPE.PICTURE:
                             img_bytes = shape.image.blob
                             img_hash = get_image_hash(img_bytes)
@@ -180,11 +201,12 @@ if uploaded_file and api_key:
                                     set_alt_text(shape, caption)
                                     api_calls += 1
                                 else:
-                                    st.warning(f"Rate limit reached on slide {i+1}. Try a smaller file.")
+                                    st.warning(f"Rate limit reached on slide {i+1}.")
                         
-                        # SMART_ART (24) / GROUPS
-                        elif getattr(shape, "shape_type", None) in [MSO_SHAPE_TYPE.GROUP, 24]:
+                        # SMART_ART (24), GRAPHIC FRAMES (19), GROUPS (6)
+                        elif getattr(shape, "shape_type", None) in [MSO_SHAPE_TYPE.GROUP, 19, 24]:
                             d_text = get_shape_text(shape)
+                            # Only caption it if we actually found text inside the diagram
                             if d_text:
                                 caption = generate_caption(client, None, prev_text, curr_text, is_diagram=True, diagram_text=d_text)
                                 if caption != "RETRY_NEEDED":
