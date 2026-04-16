@@ -2,6 +2,7 @@ import streamlit as st
 from pptx import Presentation
 from pptx.enum.shapes import MSO_SHAPE_TYPE
 from pptx.util import Inches
+from pptx.dml.color import RGBColor
 import io
 import time
 import re
@@ -55,14 +56,12 @@ def get_slide_text(slide):
 
 # --- Native ADA XML Injection Helpers ---
 def set_alt_text(shape, alt_text):
-    """Injects standard alt text."""
+    """Injects standard alt text using only 'descr' to prevent screen reader duplication."""
     try:
         for prop in ['nvPicPr', 'nvSpPr', 'nvGraphicFramePr', 'nvGrpSpPr']:
             if hasattr(shape._element, prop):
                 cNvPr = getattr(shape._element, prop).cNvPr
                 cNvPr.set('descr', alt_text)
-                # Adding 'title' attribute helps some strict PDF engines like Blackboard Ally
-                cNvPr.set('title', alt_text)
                 return
     except Exception:
         pass
@@ -120,14 +119,26 @@ def mute_smartart_children(shape):
         pass
 
 def create_ghost_overlay(slide, shape, caption):
-    """Creates an invisible rectangle over a SmartArt graphic to hold the Alt Text for PDF export."""
+    """Creates a 99% transparent rectangle to force PDF rendering of the Alt Text."""
     try:
         left, top, width, height = shape.left, shape.top, shape.width, shape.height
         overlay = slide.shapes.add_shape(MSO_SHAPE_TYPE.RECTANGLE, left, top, width, height)
-        # Make it invisible
-        overlay.fill.background()
+        
+        # 1. Force a solid white fill so the PDF engine doesn't optimize it out
+        overlay.fill.solid()
+        overlay.fill.fore_color.rgb = RGBColor(255, 255, 255)
+        
+        # 2. Inject deep XML to make that solid fill 99% transparent (1% opacity)
+        solidFill = overlay.fill._fill
+        srgbClr = solidFill.find('{http://schemas.openxmlformats.org/drawingml/2006/main}srgbClr')
+        if srgbClr is not None:
+            alpha = etree.SubElement(srgbClr, '{http://schemas.openxmlformats.org/drawingml/2006/main}alpha')
+            alpha.set('val', '1000') # 1000 = 1% opacity
+        
+        # 3. Remove border
         overlay.line.fill.background()
-        # Apply the caption to the invisible shape
+        
+        # 4. Apply Caption
         set_alt_text(overlay, caption)
     except Exception:
         pass
@@ -137,15 +148,12 @@ def force_textbox_to_title(txBox):
     try:
         nvSpPr = txBox._element.nvSpPr
         
-        # Remove the text box flag that triggers MS PowerPoint's rejection
         cNvSpPr = nvSpPr.cNvSpPr
         if 'txBox' in cNvSpPr.attrib:
             del cNvSpPr.attrib['txBox']
             
-        # Rename the shape internally
         nvSpPr.cNvPr.set('name', 'Title 1')
         
-        # Inject the official Title Placeholder tag
         nvPr = nvSpPr.nvPr
         for child in nvPr.getchildren():
             nvPr.remove(child)
@@ -249,14 +257,12 @@ def generate_and_add_title(client, slide, slide_text):
     
     for shape in slide.shapes:
         if shape.is_placeholder and hasattr(shape, "placeholder_format"):
-            # 1 = Title, 3 = Center Title
             if shape.placeholder_format.type in [1, 3]:
                 if getattr(shape, "has_text_frame", False) and shape.text.strip():
                     has_title = True
                 break 
 
     if not has_title and slide_text.strip():
-        # --- THE SEPARATOR SLIDE INTERCEPT ---
         clean_text = slide_text.strip().lower()
         common_separators = ["questions?", "questions", "any questions", "q&a", "q & a", "thank you", "conclusion"]
         
@@ -272,7 +278,6 @@ def generate_and_add_title(client, slide, slide_text):
         if is_separator or len(clean_text) < 15:
             title_to_use = fallback_title if is_separator else slide_text.strip()
             try:
-                # Placed completely off-screen at -5 inches
                 txBox = slide.shapes.add_textbox(Inches(-5), Inches(-5), Inches(1), Inches(1))
                 txBox.text = title_to_use 
                 force_textbox_to_title(txBox) 
@@ -280,7 +285,6 @@ def generate_and_add_title(client, slide, slide_text):
                 pass
             return 
 
-        # --- STANDARD AI TITLE GENERATION ---
         prompt = f"Create a concise, 3-to-6 word title for a presentation slide containing this text. Output ONLY the title.\n\nText: {slide_text}"
         try:
             response = client.models.generate_content(model='gemini-1.5-flash', contents=prompt)
@@ -333,7 +337,6 @@ if uploaded_file and api_key:
                 
                 if do_captions:
                     for shape in slide.shapes:
-                        # --- THE GHOST SHAPE INTERCEPT ---
                         if shape.is_placeholder:
                             shape_has_text = bool(get_shape_text(shape).strip())
                             shape_has_image = False
@@ -348,7 +351,6 @@ if uploaded_file and api_key:
                                 ghost_shapes += 1
                                 continue
                                 
-                        # 1. AGGRESSIVE IMAGE HUNTING
                         try:
                             if hasattr(shape, "image"):
                                 img_bytes = shape.image.blob
@@ -372,19 +374,14 @@ if uploaded_file and api_key:
                         except Exception:
                             pass
                         
-                        # 2. SMART_ART / GRAPHIC FRAMES / GROUPS
                         if getattr(shape, "shape_type", None) in [MSO_SHAPE_TYPE.GROUP, 19, 24] or hasattr(shape._element, 'nvGraphicFramePr'):
                             d_text = get_shape_text(shape)
                             caption = generate_caption(client, None, prev_text, curr_text, model_name=selected_model, is_diagram=True, diagram_text=d_text)
                             
                             if not caption.startswith("Error"):
-                                # Deep mute the children vectors
                                 mute_smartart_children(shape) 
-                                # Mute the main container (For MS Checker)
                                 mark_as_decorative(shape)
-                                # Deploy the transparent rectangle (For Blackboard PDF)
                                 create_ghost_overlay(slide, shape, caption)
-                                
                                 api_calls += 1
                             else:
                                 st.warning(f"Slide {i+1} SmartArt Issue: {caption}")
