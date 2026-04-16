@@ -1,6 +1,6 @@
 import streamlit as st
 from pptx import Presentation
-from pptx.enum.shapes import MSO_SHAPE_TYPE
+from pptx.enum.shapes import MSO_SHAPE_TYPE, MSO_SHAPE
 from pptx.util import Inches
 from pptx.dml.color import RGBColor
 import io
@@ -115,37 +115,42 @@ def mute_smartart_children(shape):
     except Exception:
         pass
 
-def create_ghost_overlay(slide, shape, caption):
-    """Creates a transparent rectangle. Explicitly named for the Selection Pane."""
+# --- The Safe Ghost Overlay Logic ---
+def safe_get_coords(shape):
     try:
-        # Fallback to standard dimensions if the SmartArt XML refuses to yield coordinates
-        left = getattr(shape, 'left', Inches(1))
-        top = getattr(shape, 'top', Inches(1.5))
-        width = getattr(shape, 'width', Inches(8))
-        height = getattr(shape, 'height', Inches(4))
+        return shape.left, shape.top, shape.width, shape.height
+    except Exception:
+        try:
+            xfrm = shape._element.xpath('.//p:xfrm | .//a:xfrm')[0]
+            off = xfrm.xpath('.//a:off')[0]
+            ext = xfrm.xpath('.//a:ext')[0]
+            return int(off.get('x')), int(off.get('y')), int(ext.get('cx')), int(ext.get('cy'))
+        except Exception:
+            return Inches(1), Inches(1), Inches(8), Inches(4)
 
-        overlay = slide.shapes.add_shape(MSO_SHAPE_TYPE.RECTANGLE, left, top, width, height)
+def create_ghost_overlay(slide, shape, caption):
+    try:
+        left, top, width, height = safe_get_coords(shape)
         
-        # Explicitly name the overlay so it appears in the Selection Pane
+        overlay = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, left, top, width, height)
         overlay.name = "ADA_Ghost_Overlay"
         
         overlay.fill.solid()
         overlay.fill.fore_color.rgb = RGBColor(255, 255, 255)
         
-        # Deep XML transparency injection
         try:
             solidFill = overlay.fill._fill
             srgbClr = solidFill.find('{http://schemas.openxmlformats.org/drawingml/2006/main}srgbClr')
             if srgbClr is not None:
                 alpha = etree.SubElement(srgbClr, '{http://schemas.openxmlformats.org/drawingml/2006/main}alpha')
-                alpha.set('val', '1000') # 1% opacity
+                alpha.set('val', '1000') # 1% opacity forces PDF export
         except Exception:
-            pass # Continue even if transparency fails
+            pass
             
         overlay.line.fill.background()
         set_alt_text(overlay, caption)
-    except Exception as e:
-        print(f"Overlay creation failed: {e}")
+    except Exception:
+        pass
 
 def force_textbox_to_title(txBox):
     try:
@@ -265,21 +270,19 @@ def generate_and_add_title(client, slide, slide_text):
                 break 
 
     if not has_title:
-        title_text = "Slide Content" # Safe fallback
+        title_text = "Slide Content" 
         
         if slide_text.strip():
-            # Dynamically infer the title using Gemini
             prompt = f"Create a concise, 3-to-6 word title for a presentation slide containing this text. Output ONLY the title.\n\nText: {slide_text}"
             for attempt in range(3):
                 try:
-                    time.sleep(2) # Small safety buffer
+                    time.sleep(2) 
                     response = client.models.generate_content(model='gemini-1.5-flash', contents=prompt)
                     title_text = response.text.strip()
                     break
                 except Exception:
                     time.sleep(4)
         else:
-            # Slide is purely visual with no text
             title_text = "Visual Presentation Slide"
 
         try:
@@ -292,7 +295,7 @@ def generate_and_add_title(client, slide, slide_text):
 # --- Main App ---
 st.set_page_config(page_title="ADA PPTX Automator Pro", layout="centered")
 st.title("♿ ADA Course Material Automator")
-st.markdown("Features deep XML native injection, Ghost Overlays for PDF compliance, and Context-Aware Title generation.")
+st.markdown("Features deep XML native injection, Safe Ghost Overlays for PDF compliance, and Context-Aware AI Title generation.")
 
 api_key = st.text_input("Enter your Gemini API Key:", type="password")
 
@@ -375,7 +378,7 @@ if uploaded_file and api_key:
                             if not caption.startswith("Error"):
                                 mute_smartart_children(shape) 
                                 mark_as_decorative(shape)
-                                create_ghost_overlay(slide, shape, caption)
+                                create_ghost_overlay(slide, shape, caption) # <--- Safe coords used here
                                 api_calls += 1
                             else:
                                 st.warning(f"Slide {i+1} SmartArt Issue: {caption}")
