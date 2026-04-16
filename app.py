@@ -3,6 +3,7 @@ from pptx import Presentation
 from pptx.enum.shapes import MSO_SHAPE_TYPE, MSO_SHAPE
 from pptx.util import Inches
 from pptx.dml.color import RGBColor
+from pptx.oxml import parse_xml # <--- The ultimate XML weapon
 import io
 import time
 import re
@@ -133,25 +134,39 @@ def create_ghost_overlay(slide, shape, caption):
         left, top, width, height = safe_get_coords(shape)
         
         overlay = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, left, top, width, height)
-        
-        # 1. UNIQUE NAMING (Fixes PDF Merger Bug)
         overlay.name = f"ADA_Ghost_Overlay_{shape.shape_id}"
         
         overlay.fill.solid()
         overlay.fill.fore_color.rgb = RGBColor(255, 255, 255)
         
-        # 2. BULLETPROOF TRANSPARENCY (Fixes Solid White Bug)
+        # 1. Bulletproof Transparency (Using your exact XML blueprint)
         try:
-            spPr = overlay._element.spPr
-            ns = {'a': 'http://schemas.openxmlformats.org/drawingml/2006/main'}
-            srgbClr = spPr.xpath('.//a:solidFill/a:srgbClr', namespaces=ns)
-            if srgbClr:
-                alpha = etree.SubElement(srgbClr[0], '{http://schemas.openxmlformats.org/drawingml/2006/main}alpha')
-                alpha.set('val', '1000') # 1000 = 1% opacity
+            # We don't need namespaces for python-pptx xpath
+            srgbClr_list = overlay._element.xpath('.//a:srgbClr')
+            if srgbClr_list:
+                srgbClr = srgbClr_list[0]
+                # 1000 = 1% opacity
+                alpha_xml = '<a:alpha xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" val="1000"/>'
+                srgbClr.append(parse_xml(alpha_xml))
         except Exception as e:
-            pass # Failsafe
+            print(f"Alpha fail: {e}")
+            pass
             
-        overlay.line.fill.background()
+        # 2. Bulletproof Invisible Border (Using your exact XML blueprint)
+        try:
+            ln_list = overlay._element.xpath('.//a:ln')
+            if ln_list:
+                ln = ln_list[0]
+                # Wipe any existing fill inside the line tag
+                for child in list(ln):
+                    ln.remove(child)
+                # Snap in the absolute noFill tag
+                noFill_xml = '<a:noFill xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"/>'
+                ln.append(parse_xml(noFill_xml))
+        except Exception as e:
+            print(f"Border fail: {e}")
+            pass
+
         set_alt_text(overlay, caption)
     except Exception:
         pass
