@@ -9,9 +9,11 @@ from PIL import Image
 from google import genai
 from google.genai import types
 
-# --- Global Cache for Deduplication ---
+# --- Global State Initialization ---
 if 'caption_cache' not in st.session_state:
     st.session_state.caption_cache = {}
+if 'last_api_call' not in st.session_state:
+    st.session_state.last_api_call = 0.0
 
 # --- Advanced Text Extraction ---
 def get_shape_text(shape):
@@ -79,12 +81,13 @@ def fix_reading_order(slide):
             parent.remove(shape._element)
             parent.append(shape._element)
 
-# --- AI Generation ---
+# --- AI Generation (With Delta-Time RPM Optimizer) ---
 def generate_caption(client, image_bytes, prev_text, curr_text, model_name, is_diagram=False, diagram_text=""):
     system_prompt = """
-    You are an expert in ADA compliance for engineering courses. 
+    You are an expert in ADA compliance for industrial and systems engineering courses. 
     Generate concise, pedagogical Alt Text (under 125 chars). 
-    Focus strictly on the system mechanics, flow, or logical structure depicted.
+    Focus strictly on the logistics systems, material flow, batch processing, or facilities design depicted. 
+    Do not describe sustainability or environmental themes.
     CRITICAL: If the image is an empty placeholder, a blank frame, or a generic PowerPoint 'click to add picture' icon, output EXACTLY: DECORATIVE.
     """
     
@@ -96,18 +99,20 @@ def generate_caption(client, image_bytes, prev_text, curr_text, model_name, is_d
         user_prompt = f"Analyze this image. Context: {curr_text}. Previous context: {prev_text}."
         contents = [image, user_prompt]
 
-    # Dynamic RPM Limit Calculation
     if "2.5-flash" in model_name:
         target_rpm = 4.0
     else:
-        target_rpm = 13.0 # Gemma and 1.5-flash
+        target_rpm = 14.0 
         
     dynamic_sleep_time = 60.0 / target_rpm
     max_retries = 3 
 
     for attempt in range(max_retries):
         try:
-            time.sleep(dynamic_sleep_time) 
+            # DELTA TIME TRACKER: Only sleep if we actually need to
+            elapsed_time = time.time() - st.session_state.last_api_call
+            if elapsed_time < dynamic_sleep_time:
+                time.sleep(dynamic_sleep_time - elapsed_time)
             
             config_args = {
                 "system_instruction": system_prompt,
@@ -121,9 +126,13 @@ def generate_caption(client, image_bytes, prev_text, curr_text, model_name, is_d
                 contents=contents,
                 config=types.GenerateContentConfig(**config_args)
             )
+            
+            # Log the time immediately after a successful call
+            st.session_state.last_api_call = time.time()
             return response.text.strip()
             
         except Exception as e:
+            st.session_state.last_api_call = time.time() # Reset clock on error too
             err_str = str(e).lower()
             if "429" in err_str or "503" in err_str or "quota" in err_str:
                 if "day" in err_str or "daily" in err_str:
@@ -151,22 +160,33 @@ def generate_caption(client, image_bytes, prev_text, curr_text, model_name, is_d
 def generate_and_add_title(client, slide, slide_text):
     has_title = False
     for shape in slide.shapes:
-        if shape.is_placeholder and shape.placeholder_format.type == 1:
-            has_title = True
-            if not shape.text.strip():
-                has_title = False
-            break
+        if shape.is_placeholder:
+            # Check for standard TITLE (1) and CENTER_TITLE (3)
+            if shape.placeholder_format.type in [1, 3]:
+                if getattr(shape, "has_text_frame", False) and shape.text.strip():
+                    has_title = True
+                break
 
     if not has_title and slide_text.strip():
-        # --- THE SEPARATOR SLIDE INTERCEPT ---
+        # --- THE SEPARATOR SLIDE INTERCEPT (Fuzzy Match) ---
         clean_text = slide_text.strip().lower()
-        common_separators = ["questions", "questions?", "any questions?", "q&a", "q & a", "thank you", "thank you!", "conclusion"]
+        common_separators = ["questions?", "questions", "any questions", "q&a", "q & a", "thank you", "conclusion"]
         
-        if clean_text in common_separators or len(clean_text) < 15:
-            fallback_title = slide_text.strip()
+        is_separator = False
+        fallback_title = "Slide Title"
+        
+        # Check if it's a transition slide, even if it has up to 60 chars of footers/dates
+        for sep in common_separators:
+            if sep in clean_text and len(clean_text) < 60:
+                is_separator = True
+                fallback_title = "Questions and Answers" if "question" in sep or "q&a" in sep else sep.title()
+                break
+                
+        if is_separator or len(clean_text) < 15:
+            title_to_use = fallback_title if is_separator else slide_text.strip()
             try:
                 txBox = slide.shapes.add_textbox(Inches(-5), Inches(-5), Inches(1), Inches(1))
-                txBox.text = f"[Hidden Title] {fallback_title}"
+                txBox.text = f"[Hidden Title] {title_to_use}"
             except Exception:
                 pass
             return 
@@ -184,7 +204,7 @@ def generate_and_add_title(client, slide, slide_text):
 # --- Main App ---
 st.set_page_config(page_title="ADA PPTX Automator Pro", layout="centered")
 st.title("♿ ADA Course Material Automator")
-st.markdown("Features aggressive image hunting, SmartArt extraction, smart rate limiting, and ghost-shape detection.")
+st.markdown("Features aggressive image hunting, SmartArt extraction, fast-path rate limiting, and ghost-shape detection.")
 
 api_key = st.text_input("Enter your Gemini API Key:", type="password")
 
