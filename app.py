@@ -133,19 +133,23 @@ def create_ghost_overlay(slide, shape, caption):
         left, top, width, height = safe_get_coords(shape)
         
         overlay = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, left, top, width, height)
-        overlay.name = "ADA_Ghost_Overlay"
+        
+        # 1. UNIQUE NAMING (Fixes PDF Merger Bug)
+        overlay.name = f"ADA_Ghost_Overlay_{shape.shape_id}"
         
         overlay.fill.solid()
         overlay.fill.fore_color.rgb = RGBColor(255, 255, 255)
         
+        # 2. BULLETPROOF TRANSPARENCY (Fixes Solid White Bug)
         try:
-            solidFill = overlay.fill._fill
-            srgbClr = solidFill.find('{http://schemas.openxmlformats.org/drawingml/2006/main}srgbClr')
-            if srgbClr is not None:
-                alpha = etree.SubElement(srgbClr, '{http://schemas.openxmlformats.org/drawingml/2006/main}alpha')
-                alpha.set('val', '1000') # 1% opacity forces PDF export
-        except Exception:
-            pass
+            spPr = overlay._element.spPr
+            ns = {'a': 'http://schemas.openxmlformats.org/drawingml/2006/main'}
+            srgbClr = spPr.xpath('.//a:solidFill/a:srgbClr', namespaces=ns)
+            if srgbClr:
+                alpha = etree.SubElement(srgbClr[0], '{http://schemas.openxmlformats.org/drawingml/2006/main}alpha')
+                alpha.set('val', '1000') # 1000 = 1% opacity
+        except Exception as e:
+            pass # Failsafe
             
         overlay.line.fill.background()
         set_alt_text(overlay, caption)
@@ -275,11 +279,10 @@ def generate_and_add_title(client, slide, slide_text, model_name):
         if slide_text.strip():
             prompt = f"Create a concise, 3-to-6 word title for a presentation slide containing this text. Output ONLY the title.\n\nText: {slide_text}"
             
-            # Dynamically build the config to support Gemma's thinking mode
             config_args = {"temperature": 0.2}
             if "gemma-4" in model_name:
                 config_args["thinking_config"] = types.ThinkingConfig(thinking_level="high")
-
+                
             for attempt in range(3):
                 try:
                     time.sleep(2) 
@@ -290,7 +293,7 @@ def generate_and_add_title(client, slide, slide_text, model_name):
                     )
                     title_text = response.text.strip()
                     break
-                except Exception as e:
+                except Exception:
                     time.sleep(4)
         else:
             title_text = "Visual Presentation Slide"
@@ -388,7 +391,7 @@ if uploaded_file and api_key:
                             if not caption.startswith("Error"):
                                 mute_smartart_children(shape) 
                                 mark_as_decorative(shape)
-                                create_ghost_overlay(slide, shape, caption) # <--- Safe coords used here
+                                create_ghost_overlay(slide, shape, caption) 
                                 api_calls += 1
                             else:
                                 st.warning(f"Slide {i+1} SmartArt Issue: {caption}")
