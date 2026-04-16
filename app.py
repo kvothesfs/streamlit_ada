@@ -259,7 +259,7 @@ def generate_caption(client, image_bytes, prev_text, curr_text, model_name, is_d
             return f"Error: {str(e)}"
     return "Error: Model overloaded."
 
-def generate_and_add_title(client, slide, slide_text):
+def generate_and_add_title(client, slide, slide_text, model_name):
     has_title = False
     
     for shape in slide.shapes:
@@ -274,13 +274,23 @@ def generate_and_add_title(client, slide, slide_text):
         
         if slide_text.strip():
             prompt = f"Create a concise, 3-to-6 word title for a presentation slide containing this text. Output ONLY the title.\n\nText: {slide_text}"
+            
+            # Dynamically build the config to support Gemma's thinking mode
+            config_args = {"temperature": 0.2}
+            if "gemma-4" in model_name:
+                config_args["thinking_config"] = types.ThinkingConfig(thinking_level="high")
+
             for attempt in range(3):
                 try:
                     time.sleep(2) 
-                    response = client.models.generate_content(model='gemini-1.5-flash', contents=prompt)
+                    response = client.models.generate_content(
+                        model=model_name, 
+                        contents=prompt,
+                        config=types.GenerateContentConfig(**config_args)
+                    )
                     title_text = response.text.strip()
                     break
-                except Exception:
+                except Exception as e:
                     time.sleep(4)
         else:
             title_text = "Visual Presentation Slide"
@@ -330,7 +340,7 @@ if uploaded_file and api_key:
                 curr_text = get_slide_text(slide) 
                 
                 if do_titles:
-                    generate_and_add_title(client, slide, curr_text)
+                    generate_and_add_title(client, slide, curr_text, selected_model)
                 
                 if do_captions:
                     for shape in slide.shapes:
