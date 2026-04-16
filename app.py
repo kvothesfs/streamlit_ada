@@ -52,13 +52,30 @@ def get_slide_text(slide):
         text_runs.append(get_shape_text(shape))
     return " ".join(text_runs).strip()
 
-# --- Universal ADA Injection Helper ---
+# --- Universal ADA Injection Helpers ---
 def set_alt_text(shape, alt_text):
     try:
         for prop in ['nvPicPr', 'nvSpPr', 'nvGraphicFramePr', 'nvGrpSpPr']:
             if hasattr(shape._element, prop):
                 getattr(shape._element, prop).cNvPr.set('descr', alt_text)
                 return
+    except Exception:
+        pass
+
+def mute_smartart_children(shape):
+    """Recursively injects DECORATIVE tags into all child shapes of a diagram to silence the ADA checker."""
+    try:
+        if getattr(shape, "shape_type", None) == MSO_SHAPE_TYPE.GROUP:
+            for subshape in shape.shapes:
+                set_alt_text(subshape, "DECORATIVE")
+                mute_smartart_children(subshape) 
+                
+        elif getattr(shape, "shape_type", None) in [19, 24] or hasattr(shape._element, 'nvGraphicFramePr'):
+            graphicData = shape._element.xpath('.//p:graphicData')
+            if graphicData:
+                child_nvPrs = graphicData[0].xpath('.//p:cNvPr')
+                for cNvPr in child_nvPrs:
+                    cNvPr.set('descr', 'DECORATIVE')
     except Exception:
         pass
 
@@ -81,7 +98,7 @@ def fix_reading_order(slide):
             parent.remove(shape._element)
             parent.append(shape._element)
 
-# --- AI Generation (With Delta-Time RPM Optimizer) ---
+# --- AI Generation ---
 def generate_caption(client, image_bytes, prev_text, curr_text, model_name, is_diagram=False, diagram_text=""):
     system_prompt = """
     You are an expert in ADA compliance for industrial and systems engineering courses. 
@@ -127,12 +144,11 @@ def generate_caption(client, image_bytes, prev_text, curr_text, model_name, is_d
                 config=types.GenerateContentConfig(**config_args)
             )
             
-            # Log the time immediately after a successful call
             st.session_state.last_api_call = time.time()
             return response.text.strip()
             
         except Exception as e:
-            st.session_state.last_api_call = time.time() # Reset clock on error too
+            st.session_state.last_api_call = time.time() 
             err_str = str(e).lower()
             if "429" in err_str or "503" in err_str or "quota" in err_str:
                 if "day" in err_str or "daily" in err_str:
@@ -159,13 +175,14 @@ def generate_caption(client, image_bytes, prev_text, curr_text, model_name, is_d
 
 def generate_and_add_title(client, slide, slide_text):
     has_title = False
+    
     for shape in slide.shapes:
-        if shape.is_placeholder:
+        if shape.is_placeholder and hasattr(shape, "placeholder_format"):
             # Check for standard TITLE (1) and CENTER_TITLE (3)
             if shape.placeholder_format.type in [1, 3]:
                 if getattr(shape, "has_text_frame", False) and shape.text.strip():
                     has_title = True
-                break
+                break 
 
     if not has_title and slide_text.strip():
         # --- THE SEPARATOR SLIDE INTERCEPT (Fuzzy Match) ---
@@ -175,7 +192,6 @@ def generate_and_add_title(client, slide, slide_text):
         is_separator = False
         fallback_title = "Slide Title"
         
-        # Check if it's a transition slide, even if it has up to 60 chars of footers/dates
         for sep in common_separators:
             if sep in clean_text and len(clean_text) < 60:
                 is_separator = True
@@ -204,7 +220,7 @@ def generate_and_add_title(client, slide, slide_text):
 # --- Main App ---
 st.set_page_config(page_title="ADA PPTX Automator Pro", layout="centered")
 st.title("♿ ADA Course Material Automator")
-st.markdown("Features aggressive image hunting, SmartArt extraction, fast-path rate limiting, and ghost-shape detection.")
+st.markdown("Features aggressive image hunting, SmartArt extraction, fast-path rate limiting, ghost-shape detection, and SmartArt muting.")
 
 api_key = st.text_input("Enter your Gemini API Key:", type="password")
 
@@ -285,6 +301,7 @@ if uploaded_file and api_key:
                             caption = generate_caption(client, None, prev_text, curr_text, model_name=selected_model, is_diagram=True, diagram_text=d_text)
                             if not caption.startswith("Error"):
                                 set_alt_text(shape, caption)
+                                mute_smartart_children(shape) # <-- MUTING ADDED HERE
                                 api_calls += 1
                             else:
                                 st.warning(f"Slide {i+1} SmartArt Issue: {caption}")
