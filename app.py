@@ -13,17 +13,14 @@ from google.genai import types
 if 'caption_cache' not in st.session_state:
     st.session_state.caption_cache = {}
 
-# --- Advanced Text Extraction (The SmartArt Data.xml Fix) ---
+# --- Advanced Text Extraction ---
 def get_shape_text(shape):
-    """Extracts text using standard API, XPath, and deep XML Relationship drilling."""
     text_content = []
     
-    # 1. Standard Text Frames
     if getattr(shape, "has_text_frame", False):
         for paragraph in shape.text_frame.paragraphs:
             text_content.append(paragraph.text)
             
-    # 2. Groups (Recursively check subshapes)
     elif getattr(shape, "shape_type", None) == MSO_SHAPE_TYPE.GROUP:
         try:
             for subshape in shape.shapes:
@@ -31,18 +28,14 @@ def get_shape_text(shape):
         except AttributeError:
             pass
             
-    # 3. SmartArt & Graphic Frames (Deep Zip Archive Dive)
     elif getattr(shape, "shape_type", None) in [19, 24] or hasattr(shape._element, 'nvGraphicFramePr'):
         try:
-            # A. Check the immediate XML for standard text nodes
             for text_node in shape._element.xpath('.//a:t'):
                 if text_node.text and text_node.text.strip():
                     text_content.append(text_node.text.strip())
                     
-            # B. Check the hidden diagramData files (where SmartArt text actually lives)
             for rel in shape.part.rels.values():
                 if "diagramData" in rel.reltype:
-                    # Decode the hidden XML file and use regex to grab all text inside <a:t> tags
                     xml_str = rel.target_part.blob.decode('utf-8', errors='ignore')
                     hidden_texts = re.findall(r'<a:t[^>]*>(.*?)</a:t>', xml_str)
                     text_content.extend([t.strip() for t in hidden_texts if t.strip()])
@@ -59,11 +52,9 @@ def get_slide_text(slide):
 
 # --- Universal ADA Injection Helper ---
 def set_alt_text(shape, alt_text):
-    """Injects alt text using native lxml .set() for absolute compliance."""
     try:
         for prop in ['nvPicPr', 'nvSpPr', 'nvGraphicFramePr', 'nvGrpSpPr']:
             if hasattr(shape._element, prop):
-                # Using .set() ensures the XML tree registers the new attribute
                 getattr(shape._element, prop).cNvPr.set('descr', alt_text)
                 return
     except Exception:
@@ -88,12 +79,13 @@ def fix_reading_order(slide):
             parent.remove(shape._element)
             parent.append(shape._element)
 
-# --- AI Generation (With Smart Dynamic UI Countdown and Quota Parsing) ---
+# --- AI Generation ---
 def generate_caption(client, image_bytes, prev_text, curr_text, model_name, is_diagram=False, diagram_text=""):
     system_prompt = """
     You are an expert in ADA compliance for engineering courses. 
     Generate concise, pedagogical Alt Text (under 125 chars). 
     Focus strictly on the system mechanics, flow, or logical structure depicted.
+    CRITICAL: If the image is an empty placeholder, a blank frame, or a generic PowerPoint 'click to add picture' icon, output EXACTLY: DECORATIVE.
     """
     
     if is_diagram:
@@ -104,12 +96,18 @@ def generate_caption(client, image_bytes, prev_text, curr_text, model_name, is_d
         user_prompt = f"Analyze this image. Context: {curr_text}. Previous context: {prev_text}."
         contents = [image, user_prompt]
 
+    # Dynamic RPM Limit Calculation
+    if "2.5-flash" in model_name:
+        target_rpm = 4.0
+    else:
+        target_rpm = 13.0 # Gemma and 1.5-flash
+        
+    dynamic_sleep_time = 60.0 / target_rpm
     max_retries = 3 
-    base_wait = 15  
 
     for attempt in range(max_retries):
         try:
-            time.sleep(3) 
+            time.sleep(dynamic_sleep_time) 
             
             config_args = {
                 "system_instruction": system_prompt,
@@ -127,17 +125,16 @@ def generate_caption(client, image_bytes, prev_text, curr_text, model_name, is_d
             
         except Exception as e:
             err_str = str(e).lower()
-            
             if "429" in err_str or "503" in err_str or "quota" in err_str:
                 if "day" in err_str or "daily" in err_str:
-                    return f"Error: Daily API quota exceeded for {model_name}. Please switch models."
+                    return f"Error: Daily API quota exceeded for {model_name}."
                 
                 if attempt < max_retries - 1:
                     sec_match = re.search(r'in\s*(\d+)\s*s', err_str)
                     if not sec_match:
                         sec_match = re.search(r'(\d+)\s*second', err_str)
                         
-                    wait_time = int(sec_match.group(1)) + 2 if sec_match else base_wait * (attempt + 1)
+                    wait_time = int(sec_match.group(1)) + 2 if sec_match else int(dynamic_sleep_time * (attempt + 2))
                     
                     countdown_placeholder = st.empty()
                     for seconds_left in range(wait_time, 0, -1):
@@ -161,6 +158,20 @@ def generate_and_add_title(client, slide, slide_text):
             break
 
     if not has_title and slide_text.strip():
+        # --- THE SEPARATOR SLIDE INTERCEPT ---
+        clean_text = slide_text.strip().lower()
+        common_separators = ["questions", "questions?", "any questions?", "q&a", "q & a", "thank you", "thank you!", "conclusion"]
+        
+        if clean_text in common_separators or len(clean_text) < 15:
+            fallback_title = slide_text.strip()
+            try:
+                txBox = slide.shapes.add_textbox(Inches(-5), Inches(-5), Inches(1), Inches(1))
+                txBox.text = f"[Hidden Title] {fallback_title}"
+            except Exception:
+                pass
+            return 
+
+        # --- STANDARD AI TITLE GENERATION ---
         prompt = f"Create a concise, 3-to-6 word title for a presentation slide containing this text. Output ONLY the title.\n\nText: {slide_text}"
         try:
             response = client.models.generate_content(model='gemini-1.5-flash', contents=prompt)
@@ -172,15 +183,15 @@ def generate_and_add_title(client, slide, slide_text):
 
 # --- Main App ---
 st.set_page_config(page_title="ADA PPTX Automator Pro", layout="centered")
-st.title("♿ ADA Course Material Automator (v10)")
-st.markdown("Features aggressive image hunting, deep SmartArt XML extraction, model fallback, and smart API error retries.")
+st.title("♿ ADA Course Material Automator")
+st.markdown("Features aggressive image hunting, SmartArt extraction, smart rate limiting, and ghost-shape detection.")
 
 api_key = st.text_input("Enter your Gemini API Key:", type="password")
 
 st.markdown("### Model Selection")
 selected_model = st.selectbox(
-    "Choose AI Model (Switch to Gemma if Gemini hits daily quota):",
-    ("gemini-2.5-flash", "gemma-4-31b-it", "gemini-1.5-flash")
+    "Choose AI Model:",
+    ("gemma-4-31b-it", "gemini-2.5-flash", "gemini-1.5-flash")
 )
 
 st.markdown("### Select ADA Fixes to Apply:")
@@ -197,6 +208,7 @@ if uploaded_file and api_key:
         
         saved_calls = 0
         api_calls = 0
+        ghost_shapes = 0
         prev_text = ""
         
         with st.spinner(f"Processing slides using {selected_model}..."):
@@ -211,6 +223,21 @@ if uploaded_file and api_key:
                 
                 if do_captions:
                     for shape in slide.shapes:
+                        # --- THE GHOST SHAPE INTERCEPT ---
+                        if shape.is_placeholder:
+                            shape_has_text = bool(get_shape_text(shape).strip())
+                            shape_has_image = False
+                            try:
+                                if hasattr(shape, "image") and shape.image.blob:
+                                    shape_has_image = True
+                            except Exception:
+                                pass
+                                
+                            if not shape_has_text and not shape_has_image:
+                                set_alt_text(shape, "DECORATIVE")
+                                ghost_shapes += 1
+                                continue
+                                
                         # 1. AGGRESSIVE IMAGE HUNTING
                         try:
                             if hasattr(shape, "image"):
@@ -235,7 +262,6 @@ if uploaded_file and api_key:
                         # 2. SMART_ART / GRAPHIC FRAMES / GROUPS
                         if getattr(shape, "shape_type", None) in [MSO_SHAPE_TYPE.GROUP, 19, 24] or hasattr(shape._element, 'nvGraphicFramePr'):
                             d_text = get_shape_text(shape)
-                            # Remove the blocker. Even if d_text is empty, use the slide context to deduce the diagram.
                             caption = generate_caption(client, None, prev_text, curr_text, model_name=selected_model, is_diagram=True, diagram_text=d_text)
                             if not caption.startswith("Error"):
                                 set_alt_text(shape, caption)
@@ -253,5 +279,5 @@ if uploaded_file and api_key:
             prs.save(output)
             output.seek(0)
             
-            st.success(f"Finished! API Calls: {api_calls} | Redundant Images Saved: {saved_calls}")
+            st.success(f"Finished! API Calls: {api_calls} | Redundant Images Saved: {saved_calls} | Ghost Shapes Ignored: {ghost_shapes}")
             st.download_button("Download ADA File", output, file_name=f"ADA_Compliant_{uploaded_file.name}")

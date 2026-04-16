@@ -2,3 +2,4 @@ streamlit
 python-pptx
 Pillow
 google-genai
+lxml
