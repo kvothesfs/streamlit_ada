@@ -56,7 +56,6 @@ def get_slide_text(slide):
 
 # --- Native ADA XML Injection Helpers ---
 def set_alt_text(shape, alt_text):
-    """Injects standard alt text using only 'descr' to prevent screen reader duplication."""
     try:
         for prop in ['nvPicPr', 'nvSpPr', 'nvGraphicFramePr', 'nvGrpSpPr']:
             if hasattr(shape._element, prop):
@@ -67,7 +66,6 @@ def set_alt_text(shape, alt_text):
         pass
 
 def mark_as_decorative(shape):
-    """Injects the native Office 365 'Mark as Decorative' XML structure."""
     try:
         cNvPr = None
         for prop in ['nvPicPr', 'nvSpPr', 'nvGraphicFramePr', 'nvGrpSpPr']:
@@ -92,7 +90,6 @@ def mark_as_decorative(shape):
         pass
 
 def mute_smartart_children(shape):
-    """Recursively applies native 'Decorative' tags to all child shapes of a diagram."""
     try:
         if getattr(shape, "shape_type", None) == MSO_SHAPE_TYPE.GROUP:
             for subshape in shape.shapes:
@@ -119,35 +116,40 @@ def mute_smartart_children(shape):
         pass
 
 def create_ghost_overlay(slide, shape, caption):
-    """Creates a 99% transparent rectangle to force PDF rendering of the Alt Text."""
+    """Creates a transparent rectangle. Explicitly named for the Selection Pane."""
     try:
-        left, top, width, height = shape.left, shape.top, shape.width, shape.height
+        # Fallback to standard dimensions if the SmartArt XML refuses to yield coordinates
+        left = getattr(shape, 'left', Inches(1))
+        top = getattr(shape, 'top', Inches(1.5))
+        width = getattr(shape, 'width', Inches(8))
+        height = getattr(shape, 'height', Inches(4))
+
         overlay = slide.shapes.add_shape(MSO_SHAPE_TYPE.RECTANGLE, left, top, width, height)
         
-        # 1. Force a solid white fill so the PDF engine doesn't optimize it out
+        # Explicitly name the overlay so it appears in the Selection Pane
+        overlay.name = "ADA_Ghost_Overlay"
+        
         overlay.fill.solid()
         overlay.fill.fore_color.rgb = RGBColor(255, 255, 255)
         
-        # 2. Inject deep XML to make that solid fill 99% transparent (1% opacity)
-        solidFill = overlay.fill._fill
-        srgbClr = solidFill.find('{http://schemas.openxmlformats.org/drawingml/2006/main}srgbClr')
-        if srgbClr is not None:
-            alpha = etree.SubElement(srgbClr, '{http://schemas.openxmlformats.org/drawingml/2006/main}alpha')
-            alpha.set('val', '1000') # 1000 = 1% opacity
-        
-        # 3. Remove border
+        # Deep XML transparency injection
+        try:
+            solidFill = overlay.fill._fill
+            srgbClr = solidFill.find('{http://schemas.openxmlformats.org/drawingml/2006/main}srgbClr')
+            if srgbClr is not None:
+                alpha = etree.SubElement(srgbClr, '{http://schemas.openxmlformats.org/drawingml/2006/main}alpha')
+                alpha.set('val', '1000') # 1% opacity
+        except Exception:
+            pass # Continue even if transparency fails
+            
         overlay.line.fill.background()
-        
-        # 4. Apply Caption
         set_alt_text(overlay, caption)
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"Overlay creation failed: {e}")
 
 def force_textbox_to_title(txBox):
-    """Hacks a standard textbox XML to become an official Title Placeholder."""
     try:
         nvSpPr = txBox._element.nvSpPr
-        
         cNvSpPr = nvSpPr.cNvSpPr
         if 'txBox' in cNvSpPr.attrib:
             del cNvSpPr.attrib['txBox']
@@ -262,33 +264,25 @@ def generate_and_add_title(client, slide, slide_text):
                     has_title = True
                 break 
 
-    if not has_title and slide_text.strip():
-        clean_text = slide_text.strip().lower()
-        common_separators = ["questions?", "questions", "any questions", "q&a", "q & a", "thank you", "conclusion"]
+    if not has_title:
+        title_text = "Slide Content" # Safe fallback
         
-        is_separator = False
-        fallback_title = "Slide Title"
-        
-        for sep in common_separators:
-            if sep in clean_text and len(clean_text) < 60:
-                is_separator = True
-                fallback_title = "Questions and Answers" if "question" in sep or "q&a" in sep else sep.title()
-                break
-                
-        if is_separator or len(clean_text) < 15:
-            title_to_use = fallback_title if is_separator else slide_text.strip()
-            try:
-                txBox = slide.shapes.add_textbox(Inches(-5), Inches(-5), Inches(1), Inches(1))
-                txBox.text = title_to_use 
-                force_textbox_to_title(txBox) 
-            except Exception:
-                pass
-            return 
+        if slide_text.strip():
+            # Dynamically infer the title using Gemini
+            prompt = f"Create a concise, 3-to-6 word title for a presentation slide containing this text. Output ONLY the title.\n\nText: {slide_text}"
+            for attempt in range(3):
+                try:
+                    time.sleep(2) # Small safety buffer
+                    response = client.models.generate_content(model='gemini-1.5-flash', contents=prompt)
+                    title_text = response.text.strip()
+                    break
+                except Exception:
+                    time.sleep(4)
+        else:
+            # Slide is purely visual with no text
+            title_text = "Visual Presentation Slide"
 
-        prompt = f"Create a concise, 3-to-6 word title for a presentation slide containing this text. Output ONLY the title.\n\nText: {slide_text}"
         try:
-            response = client.models.generate_content(model='gemini-1.5-flash', contents=prompt)
-            title_text = response.text.strip()
             txBox = slide.shapes.add_textbox(Inches(-5), Inches(-5), Inches(1), Inches(1))
             txBox.text = title_text
             force_textbox_to_title(txBox) 
@@ -298,7 +292,7 @@ def generate_and_add_title(client, slide, slide_text):
 # --- Main App ---
 st.set_page_config(page_title="ADA PPTX Automator Pro", layout="centered")
 st.title("♿ ADA Course Material Automator")
-st.markdown("Features deep XML native injection, Ghost Overlays for PDF compliance, and aggressive Title Placeholder hacking.")
+st.markdown("Features deep XML native injection, Ghost Overlays for PDF compliance, and Context-Aware Title generation.")
 
 api_key = st.text_input("Enter your Gemini API Key:", type="password")
 
