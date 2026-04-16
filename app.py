@@ -8,6 +8,7 @@ import re
 from PIL import Image
 from google import genai
 from google.genai import types
+from lxml import etree # Added to handle deep XML injection
 
 # --- Global State Initialization ---
 if 'caption_cache' not in st.session_state:
@@ -52,7 +53,7 @@ def get_slide_text(slide):
         text_runs.append(get_shape_text(shape))
     return " ".join(text_runs).strip()
 
-# --- Universal ADA Injection Helpers ---
+# --- Native ADA XML Injection Helpers ---
 def set_alt_text(shape, alt_text):
     try:
         for prop in ['nvPicPr', 'nvSpPr', 'nvGraphicFramePr', 'nvGrpSpPr']:
@@ -62,20 +63,61 @@ def set_alt_text(shape, alt_text):
     except Exception:
         pass
 
+def mark_as_decorative(shape):
+    """Injects the native Office 365 'Mark as Decorative' XML structure."""
+    try:
+        # 1. Find the core properties node (cNvPr)
+        cNvPr = None
+        for prop in ['nvPicPr', 'nvSpPr', 'nvGraphicFramePr', 'nvGrpSpPr']:
+            if hasattr(shape._element, prop):
+                cNvPr = getattr(shape._element, prop).cNvPr
+                break
+        if cNvPr is None: return
+
+        # 2. Check if an extension list exists, if not, create it
+        ns_a = 'http://schemas.openxmlformats.org/drawingml/2006/main'
+        extLst = cNvPr.find(f'.//{{{ns_a}}}extLst')
+        if extLst is None:
+            extLst = etree.SubElement(cNvPr, f'{{{ns_a}}}extLst')
+
+        # 3. Inject the specific decorative extension you found in the XML diff
+        dec_uri = "{C183D7F6-B498-43B3-948B-1728B52AA6E4}"
+        dec_ext = extLst.find(f'.//{{{ns_a}}}ext[@uri="{dec_uri}"]')
+        if dec_ext is None:
+            ext = etree.SubElement(extLst, f'{{{ns_a}}}ext', uri=dec_uri)
+            etree.SubElement(ext, '{http://schemas.microsoft.com/office/drawing/2017/decorative}decorative', val="1")
+            
+        # Also set the traditional descr field as a fallback for older screen readers
+        cNvPr.set('descr', 'DECORATIVE')
+    except Exception:
+        pass
+
 def mute_smartart_children(shape):
-    """Recursively injects DECORATIVE tags into all child shapes of a diagram to silence the ADA checker."""
+    """Recursively applies native 'Decorative' tags to all child shapes of a diagram."""
     try:
         if getattr(shape, "shape_type", None) == MSO_SHAPE_TYPE.GROUP:
             for subshape in shape.shapes:
-                set_alt_text(subshape, "DECORATIVE")
+                mark_as_decorative(subshape)
                 mute_smartart_children(subshape) 
                 
         elif getattr(shape, "shape_type", None) in [19, 24] or hasattr(shape._element, 'nvGraphicFramePr'):
             graphicData = shape._element.xpath('.//p:graphicData')
             if graphicData:
-                child_nvPrs = graphicData[0].xpath('.//p:cNvPr')
+                # We target the specific child cNvPr tags directly
+                child_nvPrs = graphicData[0].xpath('.//p:cNvPr', namespaces={'p': 'http://schemas.openxmlformats.org/presentationml/2006/main'})
+                ns_a = 'http://schemas.openxmlformats.org/drawingml/2006/main'
+                
                 for cNvPr in child_nvPrs:
-                    cNvPr.set('descr', 'DECORATIVE')
+                    cNvPr.set('descr', 'DECORATIVE') # Fallback
+                    
+                    extLst = cNvPr.find(f'.//{{{ns_a}}}extLst')
+                    if extLst is None:
+                        extLst = etree.SubElement(cNvPr, f'{{{ns_a}}}extLst')
+                    
+                    dec_uri = "{C183D7F6-B498-43B3-948B-1728B52AA6E4}"
+                    if extLst.find(f'.//{{{ns_a}}}ext[@uri="{dec_uri}"]') is None:
+                        ext = etree.SubElement(extLst, f'{{{ns_a}}}ext', uri=dec_uri)
+                        etree.SubElement(ext, '{http://schemas.microsoft.com/office/drawing/2017/decorative}decorative', val="1")
     except Exception:
         pass
 
@@ -103,9 +145,8 @@ def generate_caption(client, image_bytes, prev_text, curr_text, model_name, is_d
     system_prompt = """
     You are an expert in ADA compliance for industrial and systems engineering courses. 
     Generate concise, pedagogical Alt Text (under 125 chars). 
-    Focus strictly on the logistics systems, material flow, batch processing, or facilities design depicted. 
-    Do not describe sustainability or environmental themes.
-    CRITICAL: If the image is an empty placeholder, a blank frame, or a generic PowerPoint 'click to add picture' icon, output EXACTLY: DECORATIVE.
+    Focus on the logistics systems, material flow, batch processing, or facilities design depicted. 
+    Mention sustainability or environmental themes from the Engineering for One Planet Framework when appropriate.
     """
     
     if is_diagram:
@@ -126,7 +167,6 @@ def generate_caption(client, image_bytes, prev_text, curr_text, model_name, is_d
 
     for attempt in range(max_retries):
         try:
-            # DELTA TIME TRACKER: Only sleep if we actually need to
             elapsed_time = time.time() - st.session_state.last_api_call
             if elapsed_time < dynamic_sleep_time:
                 time.sleep(dynamic_sleep_time - elapsed_time)
@@ -165,27 +205,37 @@ def generate_caption(client, image_bytes, prev_text, curr_text, model_name, is_d
                     for seconds_left in range(wait_time, 0, -1):
                         countdown_placeholder.warning(f"⏳ Rate limit hit! Resuming in {seconds_left} seconds...")
                         time.sleep(1)
-                    
                     countdown_placeholder.empty() 
                     continue 
-                    
             return f"Error: {str(e)}"
-            
-    return "Error: Model overloaded after max retries."
+    return "Error: Model overloaded."
+
+def force_textbox_to_title(txBox):
+    """Hacks a standard textbox XML to become an official Title Placeholder."""
+    try:
+        nvPr = txBox._element.nvSpPr.nvPr
+        # Remove any existing placeholder definitions
+        for child in nvPr.getchildren():
+            nvPr.remove(child)
+        # Inject the official title tag
+        ns_p = "http://schemas.openxmlformats.org/presentationml/2006/main"
+        etree.SubElement(nvPr, f"{{{ns_p}}}ph", type="title")
+    except Exception:
+        pass
 
 def generate_and_add_title(client, slide, slide_text):
     has_title = False
     
     for shape in slide.shapes:
         if shape.is_placeholder and hasattr(shape, "placeholder_format"):
-            # Check for standard TITLE (1) and CENTER_TITLE (3)
+            # 1 = Title, 3 = Center Title
             if shape.placeholder_format.type in [1, 3]:
                 if getattr(shape, "has_text_frame", False) and shape.text.strip():
                     has_title = True
                 break 
 
     if not has_title and slide_text.strip():
-        # --- THE SEPARATOR SLIDE INTERCEPT (Fuzzy Match) ---
+        # --- THE SEPARATOR SLIDE INTERCEPT ---
         clean_text = slide_text.strip().lower()
         common_separators = ["questions?", "questions", "any questions", "q&a", "q & a", "thank you", "conclusion"]
         
@@ -202,7 +252,8 @@ def generate_and_add_title(client, slide, slide_text):
             title_to_use = fallback_title if is_separator else slide_text.strip()
             try:
                 txBox = slide.shapes.add_textbox(Inches(-5), Inches(-5), Inches(1), Inches(1))
-                txBox.text = f"[Hidden Title] {title_to_use}"
+                txBox.text = title_to_use # No longer need [Hidden Title] string since it's a real title now
+                force_textbox_to_title(txBox) # <--- HACK INITIATED
             except Exception:
                 pass
             return 
@@ -213,14 +264,15 @@ def generate_and_add_title(client, slide, slide_text):
             response = client.models.generate_content(model='gemini-1.5-flash', contents=prompt)
             title_text = response.text.strip()
             txBox = slide.shapes.add_textbox(Inches(-5), Inches(-5), Inches(1), Inches(1))
-            txBox.text = f"[Hidden Title] {title_text}"
+            txBox.text = title_text
+            force_textbox_to_title(txBox) # <--- HACK INITIATED
         except Exception:
             pass
 
 # --- Main App ---
 st.set_page_config(page_title="ADA PPTX Automator Pro", layout="centered")
 st.title("♿ ADA Course Material Automator")
-st.markdown("Features aggressive image hunting, SmartArt extraction, fast-path rate limiting, ghost-shape detection, and SmartArt muting.")
+st.markdown("Features deep XML native injection, SmartArt muting, fast-path rate limiting, and placeholder hacking.")
 
 api_key = st.text_input("Enter your Gemini API Key:", type="password")
 
@@ -270,7 +322,7 @@ if uploaded_file and api_key:
                                 pass
                                 
                             if not shape_has_text and not shape_has_image:
-                                set_alt_text(shape, "DECORATIVE")
+                                mark_as_decorative(shape) # <--- NATIVE TAG INJECTED
                                 ghost_shapes += 1
                                 continue
                                 
@@ -287,7 +339,10 @@ if uploaded_file and api_key:
                                     caption = generate_caption(client, img_bytes, prev_text, curr_text, model_name=selected_model)
                                     if not caption.startswith("Error"):
                                         st.session_state.caption_cache[img_hash] = caption
-                                        set_alt_text(shape, caption)
+                                        if caption.upper() == "DECORATIVE":
+                                            mark_as_decorative(shape)
+                                        else:
+                                            set_alt_text(shape, caption)
                                         api_calls += 1
                                     else:
                                         st.warning(f"Slide {i+1} Issue: {caption}")
@@ -301,7 +356,7 @@ if uploaded_file and api_key:
                             caption = generate_caption(client, None, prev_text, curr_text, model_name=selected_model, is_diagram=True, diagram_text=d_text)
                             if not caption.startswith("Error"):
                                 set_alt_text(shape, caption)
-                                mute_smartart_children(shape) # <-- MUTING ADDED HERE
+                                mute_smartart_children(shape) # <--- NATIVE TAGS APPLIED TO CHILDREN
                                 api_calls += 1
                             else:
                                 st.warning(f"Slide {i+1} SmartArt Issue: {caption}")
@@ -316,5 +371,5 @@ if uploaded_file and api_key:
             prs.save(output)
             output.seek(0)
             
-            st.success(f"Finished! API Calls: {api_calls} | Redundant Images Saved: {saved_calls} | Ghost Shapes Ignored: {ghost_shapes}")
+            st.success(f"Finished! API Calls: {api_calls} | Redundant Images Saved: {saved_calls} | Ghost Shapes Muted: {ghost_shapes}")
             st.download_button("Download ADA File", output, file_name=f"ADA_Compliant_{uploaded_file.name}")
