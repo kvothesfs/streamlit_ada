@@ -1,7 +1,9 @@
 import streamlit as st
 from pptx import Presentation
-from pptx.enum.shapes import MSO_SHAPE_TYPE
+from pptx.enum.shapes import MSO_SHAPE_TYPE, MSO_SHAPE
 from pptx.util import Inches
+from pptx.dml.color import RGBColor
+from pptx.oxml import parse_xml # <--- The ultimate XML weapon
 import io
 import time
 import re
@@ -16,7 +18,7 @@ if 'caption_cache' not in st.session_state:
 if 'last_api_call' not in st.session_state:
     st.session_state.last_api_call = 0.0
 
-# --- Advanced Text Extraction (Reads SmartArt text for Context-Aware Titles) ---
+# --- Advanced Text Extraction ---
 def get_shape_text(shape):
     text_content = []
     
@@ -65,7 +67,6 @@ def set_alt_text(shape, alt_text):
         pass
 
 def mark_as_decorative(shape):
-    """Injects the native Office 365 'Mark as Decorative' XML structure for empty placeholders."""
     try:
         cNvPr = None
         for prop in ['nvPicPr', 'nvSpPr', 'nvGraphicFramePr', 'nvGrpSpPr']:
@@ -86,6 +87,87 @@ def mark_as_decorative(shape):
             etree.SubElement(ext, '{http://schemas.microsoft.com/office/drawing/2017/decorative}decorative', val="1")
             
         cNvPr.set('descr', 'DECORATIVE')
+    except Exception:
+        pass
+
+def mute_smartart_children(shape):
+    try:
+        if getattr(shape, "shape_type", None) == MSO_SHAPE_TYPE.GROUP:
+            for subshape in shape.shapes:
+                mark_as_decorative(subshape)
+                mute_smartart_children(subshape) 
+                
+        elif getattr(shape, "shape_type", None) in [19, 24] or hasattr(shape._element, 'nvGraphicFramePr'):
+            graphicData = shape._element.xpath('.//p:graphicData')
+            if graphicData:
+                child_nvPrs = graphicData[0].xpath('.//p:cNvPr', namespaces={'p': 'http://schemas.openxmlformats.org/presentationml/2006/main'})
+                ns_a = 'http://schemas.openxmlformats.org/drawingml/2006/main'
+                
+                for cNvPr in child_nvPrs:
+                    cNvPr.set('descr', 'DECORATIVE') 
+                    extLst = cNvPr.find(f'.//{{{ns_a}}}extLst')
+                    if extLst is None:
+                        extLst = etree.SubElement(cNvPr, f'{{{ns_a}}}extLst')
+                    
+                    dec_uri = "{C183D7F6-B498-43B3-948B-1728B52AA6E4}"
+                    if extLst.find(f'.//{{{ns_a}}}ext[@uri="{dec_uri}"]') is None:
+                        ext = etree.SubElement(extLst, f'{{{ns_a}}}ext', uri=dec_uri)
+                        etree.SubElement(ext, '{http://schemas.microsoft.com/office/drawing/2017/decorative}decorative', val="1")
+    except Exception:
+        pass
+
+# --- The Safe Ghost Overlay Logic ---
+def safe_get_coords(shape):
+    try:
+        return shape.left, shape.top, shape.width, shape.height
+    except Exception:
+        try:
+            xfrm = shape._element.xpath('.//p:xfrm | .//a:xfrm')[0]
+            off = xfrm.xpath('.//a:off')[0]
+            ext = xfrm.xpath('.//a:ext')[0]
+            return int(off.get('x')), int(off.get('y')), int(ext.get('cx')), int(ext.get('cy'))
+        except Exception:
+            return Inches(1), Inches(1), Inches(8), Inches(4)
+
+def create_ghost_overlay(slide, shape, caption):
+    try:
+        left, top, width, height = safe_get_coords(shape)
+        
+        overlay = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, left, top, width, height)
+        overlay.name = f"ADA_Ghost_Overlay_{shape.shape_id}"
+        
+        overlay.fill.solid()
+        overlay.fill.fore_color.rgb = RGBColor(255, 255, 255)
+        
+        # 1. Bulletproof Transparency (Using your exact XML blueprint)
+        try:
+            # We don't need namespaces for python-pptx xpath
+            srgbClr_list = overlay._element.xpath('.//a:srgbClr')
+            if srgbClr_list:
+                srgbClr = srgbClr_list[0]
+                # 1000 = 1% opacity
+                alpha_xml = '<a:alpha xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" val="1000"/>'
+                srgbClr.append(parse_xml(alpha_xml))
+        except Exception as e:
+            print(f"Alpha fail: {e}")
+            pass
+            
+        # 2. Bulletproof Invisible Border (Using your exact XML blueprint)
+        try:
+            ln_list = overlay._element.xpath('.//a:ln')
+            if ln_list:
+                ln = ln_list[0]
+                # Wipe any existing fill inside the line tag
+                for child in list(ln):
+                    ln.remove(child)
+                # Snap in the absolute noFill tag
+                noFill_xml = '<a:noFill xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"/>'
+                ln.append(parse_xml(noFill_xml))
+        except Exception as e:
+            print(f"Border fail: {e}")
+            pass
+
+        set_alt_text(overlay, caption)
     except Exception:
         pass
 
@@ -126,7 +208,7 @@ def fix_reading_order(slide):
             parent.append(shape._element)
 
 # --- AI Generation ---
-def generate_caption(client, image_bytes, prev_text, curr_text, model_name):
+def generate_caption(client, image_bytes, prev_text, curr_text, model_name, is_diagram=False, diagram_text=""):
     system_prompt = """
     You are an expert in ADA compliance for industrial and systems engineering courses. 
     Generate concise, pedagogical Alt Text (under 125 chars). 
@@ -135,9 +217,13 @@ def generate_caption(client, image_bytes, prev_text, curr_text, model_name):
     CRITICAL: If the image is an empty placeholder, a blank frame, or a generic PowerPoint 'click to add picture' icon, output EXACTLY: DECORATIVE.
     """
     
-    image = Image.open(io.BytesIO(image_bytes))
-    user_prompt = f"Analyze this image. Context: {curr_text}. Previous context: {prev_text}."
-    contents = [image, user_prompt]
+    if is_diagram:
+        user_prompt = f"Describe this structural diagram based on its extracted text: '{diagram_text}'. Context from the rest of the slide: {curr_text}"
+        contents = [user_prompt]
+    else:
+        image = Image.open(io.BytesIO(image_bytes))
+        user_prompt = f"Analyze this image. Context: {curr_text}. Previous context: {prev_text}."
+        contents = [image, user_prompt]
 
     if "2.5-flash" in model_name:
         target_rpm = 4.0
@@ -237,7 +323,7 @@ def generate_and_add_title(client, slide, slide_text, model_name):
 # --- Main App ---
 st.set_page_config(page_title="ADA PPTX Automator Pro", layout="centered")
 st.title("♿ ADA Course Material Automator")
-st.markdown("Automates ADA compliance by fixing reading orders, generating context-aware titles, and writing pedagogical image captions.")
+st.markdown("Features deep XML native injection, Safe Ghost Overlays for PDF compliance, and Context-Aware AI Title generation.")
 
 api_key = st.text_input("Enter your Gemini API Key:", type="password")
 
@@ -248,12 +334,9 @@ selected_model = st.selectbox(
 )
 
 st.markdown("### Select ADA Fixes to Apply:")
-do_captions = st.checkbox("Generate Image Captions (Alt Text)", value=True)
+do_captions = st.checkbox("Generate Image/SmartArt Captions (Alt Text)", value=True)
 do_titles = st.checkbox("Generate Missing Slide Titles", value=True)
 do_reading_order = st.checkbox("Fix Reading Order (Top-to-Bottom)", value=True)
-
-# --- THE SMARTART WARNING ---
-st.warning("⚠️ **Important for SmartArt:** If your presentation contains SmartArt diagrams, you must flatten them before uploading using the provided VBA Batch Macro (or right-click -> Cut -> Paste as Picture). Otherwise, Blackboard Ally will flag the PDF.")
 
 uploaded_file = st.file_uploader("Upload PowerPoint File", type=["pptx"])
 
@@ -279,7 +362,6 @@ if uploaded_file and api_key:
                 
                 if do_captions:
                     for shape in slide.shapes:
-                        # --- Empty Placeholder Detection ---
                         if shape.is_placeholder:
                             shape_has_text = bool(get_shape_text(shape).strip())
                             shape_has_image = False
@@ -294,7 +376,6 @@ if uploaded_file and api_key:
                                 ghost_shapes += 1
                                 continue
                                 
-                        # --- Standard Image Captioning ---
                         try:
                             if hasattr(shape, "image"):
                                 img_bytes = shape.image.blob
@@ -317,6 +398,18 @@ if uploaded_file and api_key:
                                 continue 
                         except Exception:
                             pass
+                        
+                        if getattr(shape, "shape_type", None) in [MSO_SHAPE_TYPE.GROUP, 19, 24] or hasattr(shape._element, 'nvGraphicFramePr'):
+                            d_text = get_shape_text(shape)
+                            caption = generate_caption(client, None, prev_text, curr_text, model_name=selected_model, is_diagram=True, diagram_text=d_text)
+                            
+                            if not caption.startswith("Error"):
+                                mute_smartart_children(shape) 
+                                mark_as_decorative(shape)
+                                create_ghost_overlay(slide, shape, caption) 
+                                api_calls += 1
+                            else:
+                                st.warning(f"Slide {i+1} SmartArt Issue: {caption}")
                                     
                 if do_reading_order:
                     fix_reading_order(slide)
@@ -328,5 +421,5 @@ if uploaded_file and api_key:
             prs.save(output)
             output.seek(0)
             
-            st.success(f"Finished! API Calls: {api_calls} | Redundant Images Cached: {saved_calls} | Ghost Shapes Muted: {ghost_shapes}")
+            st.success(f"Finished! API Calls: {api_calls} | Redundant Images Saved: {saved_calls} | Ghost Shapes Muted: {ghost_shapes}")
             st.download_button("Download ADA File", output, file_name=f"ADA_Compliant_{uploaded_file.name}")
